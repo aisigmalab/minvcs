@@ -24,15 +24,11 @@ enum Commands {
         path: PathBuf,
     },
 
-    /// Print diff of two files
-    Diff {
-        /// Source file to take diff
+    /// Print an object specified by a hash key
+    Cat {
         #[clap(value_parser)]
-        source: String,
-        /// Target file to take diff
-        #[clap(value_parser)]
-        target: String
-    }
+        hash: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -41,6 +37,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Init => commands::init::run(),
         Commands::Snap => commands::snap::run(),
         Commands::Store {path} => commands::store::run(&path),
-        Commands::Diff {source: _, target: _} => Err(anyhow::anyhow!("Not implemented!")),
+        Commands::Cat {hash} => commands::cat::run(&hash),
     }
 }

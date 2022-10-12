@@ -1,18 +1,55 @@
+use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
 static EXCLUDE_MINVCS: &str = ".minvcs";
 
-pub enum StoreableObject {
-    File { path: PathBuf }
+pub type Hash = String;
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DirectoryNode {
+    name: String,
+    hash: String
+}
+
+pub enum StoredObject {
+    File { body: Vec<u8>, hash: Hash },
+    Directory { children: Vec<DirectoryNode>, hash: Hash }
+}
+
+impl fmt::Display for DirectoryNode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.hash, self.name)
+    }
+}
+
+impl fmt::Display for StoredObject {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use StoredObject::*;
+        match *self {
+            File {ref body, ref hash} => {
+                write!(f, "File {}\n{}\n", hash, String::from_utf8_lossy(body))
+            },
+            Directory {ref children, ref hash} => {
+                write!(f, "Directory {}\n", hash)?;
+                for child in children {
+                    write!(f, "{}\n", child)?
+                }
+                Ok(())
+            }
+        }
+
+    }
 }
 
 pub struct ObjectManager {
@@ -28,16 +65,63 @@ impl ObjectManager {
         self.root_dir.join(".minvcs").join("objects")
     }
 
-    pub fn store_object(&self, object: &StoreableObject) -> anyhow::Result<()> {
-        match object {
-            StoreableObject::File { path } => {
-                let mut exclude_list: HashSet<PathBuf> = HashSet::new();
-                let minvcs_path = self.root_dir.join(EXCLUDE_MINVCS);
-                exclude_list.insert(minvcs_path);
-                self.store_file(path.as_path(), &mut exclude_list)?
-            },
-        };
+    pub fn get_object_file_path<'a>(&self, hash: &'a str) -> (PathBuf, &'a str) {
+        (self.get_object_dir().join(&hash[..2]), &hash[2..])
+    }
+
+    pub fn store_path(&self, path: &Path) -> anyhow::Result<()> {
+        let mut exclude_list: HashSet<PathBuf> = HashSet::new();
+        let minvcs_path = self.root_dir.join(EXCLUDE_MINVCS);
+        exclude_list.insert(minvcs_path);
+        self.store_file(path, &mut exclude_list)?;
         Ok(())
+    }
+
+    pub fn retrieve_object(&self, hash: &str) -> anyhow::Result<StoredObject> {
+        let (store_dir, store_file_name) = self.get_object_file_path(hash);
+        let object_file_path = store_dir.join(store_file_name);
+        let compressed_object = fs::read(object_file_path.as_path())?;
+        let mut object = Vec::new();
+        let mut decoder = ZlibDecoder::new(&compressed_object[..]);
+        decoder.read_to_end(&mut object)?;
+        let mut sha256 = Sha256::new();
+        sha256.update(&object);
+        let object_hash = sha256.finalize();
+        let object_hash_string: String = object_hash.iter()
+                .map(|n| format!("{:02x}", n))
+                .collect::<String>();
+        if hash != object_hash_string {
+            return Err(anyhow::anyhow!(format!("Object file is invalid (Mismatching hash): {}", object_hash_string)))
+        }
+        if let Some(null_idx) = object.iter().position(|&x| x == 0) {
+            let header = String::from_utf8(object[0..null_idx].to_vec())?;
+            let body = &object[null_idx + 1..];
+            let object_type = header.split(" ").next();
+            return match object_type {
+                Some("file") => {
+                    Ok(StoredObject::File { body: body.to_vec(), hash: object_hash_string })
+                },
+                Some("directory") => {
+                    let mut children = Vec::new();
+                    for line in String::from_utf8(body.to_vec())?.lines() {
+                        if let Some((child_hash, child_file_name)) = line.split_once(" ") {
+                            children.push(DirectoryNode { name: child_file_name.to_string(), hash: child_hash.to_string() });
+                        } else {
+                            return Err(anyhow::anyhow!(format!("Object file is invalid (directory): {}", object_file_path.display())))
+                        }
+                    }
+                    Ok(StoredObject::Directory { children, hash: object_hash_string })
+                },
+                Some(_) => {
+                    Err(anyhow::anyhow!(format!("Object file is invalid (Unknown object type): {}", object_file_path.display())))
+                }
+                None => {
+                    Err(anyhow::anyhow!(format!("Object file is invalid (No type in header): {}", object_file_path.display())))
+                }
+            }
+        } else {
+            Err(anyhow::anyhow!(format!("Object file is invalid (No header): {}", object_file_path.display())))
+        }
     }
 
     fn store_file(&self, path: &Path, exclude_list: &mut HashSet<PathBuf>) -> anyhow::Result<String> {
@@ -74,7 +158,7 @@ impl ObjectManager {
                     continue;
                 }
             }
-            let body = ObjectManager::create_dir_body(children)?;
+            let body = ObjectManager::create_dir_body(&mut children)?;
             let header = format!("directory {}\0", body.len());
             (body, header)
         } else if path.is_file() {
@@ -95,17 +179,17 @@ impl ObjectManager {
             .collect::<String>();
         println!("File: {}, Hash: {}", path.display(), hash_string);
 
-        let store_dir = self.get_object_dir().join(&hash_string[..2]);
+        let (store_dir, store_file_name) = self.get_object_file_path(&hash_string);
 
         std::fs::create_dir_all(store_dir.as_path())?;
-        let file = File::create(store_dir.join(&hash_string[2..]))?;
+        let file = File::create(store_dir.join(store_file_name))?;
         let mut encoder = ZlibEncoder::new(file, Compression::fast());
         encoder.write_all(&content)?;
         encoder.finish()?;
         Ok(hash_string)
     }
 
-    fn create_dir_body(mut children: Vec<(String, String)>) -> anyhow::Result<Vec<u8>> {
+    fn create_dir_body(children: &mut Vec<(String, String)>) -> anyhow::Result<Vec<u8>> {
         let mut result: Vec<u8> = Vec::new();
         children.sort();
         for (file_name, hash) in children {
