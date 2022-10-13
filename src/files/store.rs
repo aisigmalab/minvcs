@@ -3,6 +3,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha2::Digest;
 use sha2::Sha256;
+use tempfile::NamedTempFile;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
@@ -19,12 +20,24 @@ pub type Hash = String;
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DirectoryNode {
     name: String,
-    hash: String
+    hash: String,
+}
+
+pub struct SnapshotMetadata {
+    pub author: String,
+    pub comment: String,
 }
 
 pub enum StoredObject {
     File { body: Vec<u8>, hash: Hash },
-    Directory { children: Vec<DirectoryNode>, hash: Hash }
+    Directory { children: Vec<DirectoryNode>, hash: Hash },
+    Snapshot { body: Vec<u8>, hash: Hash }, // for now
+}
+
+impl fmt::Display for SnapshotMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "author:{}\n\n{}", self.author, self.comment)
+    }
 }
 
 impl fmt::Display for DirectoryNode {
@@ -46,7 +59,10 @@ impl fmt::Display for StoredObject {
                     write!(f, "{}\n", child)?
                 }
                 Ok(())
-            }
+            },
+            Snapshot {ref body, ref hash} => {
+                write!(f, "Snapshot {}\n{}\n", hash, String::from_utf8_lossy(body))
+            },
         }
 
     }
@@ -69,12 +85,21 @@ impl ObjectManager {
         (self.get_object_dir().join(&hash[..2]), &hash[2..])
     }
 
-    pub fn store_path(&self, path: &Path) -> anyhow::Result<()> {
+    pub fn get_head_file_path(&self) -> PathBuf {
+        self.root_dir.join(".minvcs").join("head")
+    }
+
+    pub fn store_path(&self, path: &Path) -> anyhow::Result<String> {
         let mut exclude_list: HashSet<PathBuf> = HashSet::new();
         let minvcs_path = self.root_dir.join(EXCLUDE_MINVCS);
         exclude_list.insert(minvcs_path);
-        self.store_file(path, &mut exclude_list)?;
-        Ok(())
+        self.store_file_tree(path, &mut exclude_list)
+    }
+
+    pub fn snapshot(&self, metadata: &SnapshotMetadata) -> anyhow::Result<()> {
+        let root_hash = self.store_path(&self.root_dir)?;
+        let snapshot_hash = self.store_snapshot(&root_hash, metadata)?;
+        self.move_head(&snapshot_hash)
     }
 
     pub fn retrieve_object(&self, hash: &str) -> anyhow::Result<StoredObject> {
@@ -112,6 +137,9 @@ impl ObjectManager {
                     }
                     Ok(StoredObject::Directory { children, hash: object_hash_string })
                 },
+                Some("snap") => {
+                    Ok(StoredObject::Snapshot { body: body.to_vec(), hash: object_hash_string })
+                },
                 Some(_) => {
                     Err(anyhow::anyhow!(format!("Object file is invalid (Unknown object type): {}", object_file_path.display())))
                 }
@@ -124,7 +152,9 @@ impl ObjectManager {
         }
     }
 
-    fn store_file(&self, path: &Path, exclude_list: &mut HashSet<PathBuf>) -> anyhow::Result<String> {
+    /// Stores all files under the given path except the ones in exclude_list
+    /// and returns the hash of the object corresponding to the given path
+    fn store_file_tree(&self, path: &Path, exclude_list: &mut HashSet<PathBuf>) -> anyhow::Result<String> {
         if !path.exists() {
             return Err(anyhow::anyhow!(format!(
                 "Path does not exist: {}",
@@ -151,7 +181,7 @@ impl ObjectManager {
                     }
                     let child = (
                         file_name.to_string(),
-                        self.store_file(child_path.as_path(), exclude_list)?);
+                        self.store_file_tree(child_path.as_path(), exclude_list)?);
                     children.push(child);
                 } else {
                     println!("Only Unicode file name is supported. Excluded {}", entry.path().display());
@@ -170,6 +200,13 @@ impl ObjectManager {
         };
 
         let content = [header.as_bytes(), &body[..]].concat();
+        let hash_string = self.store_binary_compressed(&content)?;
+        println!("File: {}, Hash: {}", path.display(), hash_string);
+        Ok(hash_string)
+    }
+
+    /// Take binary as &Vec<u8>, calculate hash, and store it as a proper file name with zlib compression
+    fn store_binary_compressed(&self, content: &Vec<u8>) -> anyhow::Result<String> {
         let mut sha256 = Sha256::new();
         sha256.update(&content);
         let hash = sha256.finalize();
@@ -177,7 +214,6 @@ impl ObjectManager {
             .iter()
             .map(|n| format!("{:02x}", n))
             .collect::<String>();
-        println!("File: {}, Hash: {}", path.display(), hash_string);
 
         let (store_dir, store_file_name) = self.get_object_file_path(&hash_string);
 
@@ -186,6 +222,23 @@ impl ObjectManager {
         let mut encoder = ZlibEncoder::new(file, Compression::fast());
         encoder.write_all(&content)?;
         encoder.finish()?;
+        Ok(hash_string)
+    }
+
+    pub fn move_head(&self, hash: &str) -> anyhow::Result<()> {
+        let temp_head_file = NamedTempFile::new()?;
+        write!(temp_head_file.as_file(), "{}", hash)?;
+        fs::copy(temp_head_file.path(), self.get_head_file_path())?;
+        println!("Head successfully updated to {}", hash);
+        Ok(())
+    }
+
+    fn store_snapshot(&self, hash: &str, metadata: &SnapshotMetadata) -> anyhow::Result<String> {
+        let body = format!("{}\n{}", hash, metadata);
+        let header = format!("snap {}\0", body.as_bytes().len());
+        let content = [header.as_bytes(), body.as_bytes()].concat();
+        let hash_string = self.store_binary_compressed(&content)?;
+        println!("Snapshot Root: {}, Snapshot Hash: {}", hash, hash_string);
         Ok(hash_string)
     }
 
