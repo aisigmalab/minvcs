@@ -26,6 +26,7 @@ pub struct DirectoryNode {
 pub struct SnapshotMetadata {
     pub author: String,
     pub comment: String,
+    pub parents: Vec<String>,
 }
 
 pub enum StoredObject {
@@ -36,7 +37,11 @@ pub enum StoredObject {
 
 impl fmt::Display for SnapshotMetadata {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "author:{}\n\n{}", self.author, self.comment)
+        write!(f, "author:{}\n", self.author)?;
+        for parent in &self.parents {
+            write!(f, "parent:{}\n", parent)?;
+        }
+        write!(f, "\n{}", self.comment)
     }
 }
 
@@ -89,6 +94,17 @@ impl ObjectManager {
         self.root_dir.join(".minvcs").join("head")
     }
 
+    pub fn get_head(&self) -> anyhow::Result<Option<Hash>> {
+        let head_file_path = self.get_head_file_path();
+        if !head_file_path.exists() {
+            return Ok(None);
+        }
+        let mut head_file = File::open(head_file_path)?;
+        let mut hash = String::new();
+        head_file.read_to_string(&mut hash)?;
+        return Ok(Some(hash));
+    }
+
     pub fn store_path(&self, path: &Path) -> anyhow::Result<String> {
         let mut exclude_list: HashSet<PathBuf> = HashSet::new();
         let minvcs_path = self.root_dir.join(EXCLUDE_MINVCS);
@@ -137,7 +153,7 @@ impl ObjectManager {
                     }
                     Ok(StoredObject::Directory { children, hash: object_hash_string })
                 },
-                Some("snap") => {
+                Some("snapshot") => {
                     Ok(StoredObject::Snapshot { body: body.to_vec(), hash: object_hash_string })
                 },
                 Some(_) => {
@@ -235,7 +251,7 @@ impl ObjectManager {
 
     fn store_snapshot(&self, hash: &str, metadata: &SnapshotMetadata) -> anyhow::Result<String> {
         let body = format!("{}\n{}", hash, metadata);
-        let header = format!("snap {}\0", body.as_bytes().len());
+        let header = format!("snapshot {}\0", body.as_bytes().len());
         let content = [header.as_bytes(), body.as_bytes()].concat();
         let hash_string = self.store_binary_compressed(&content)?;
         println!("Snapshot Root: {}, Snapshot Hash: {}", hash, hash_string);
